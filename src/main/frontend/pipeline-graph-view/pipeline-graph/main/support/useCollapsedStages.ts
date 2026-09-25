@@ -2,7 +2,11 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 
 import { Result, StageInfo } from "../PipelineGraphModel.tsx";
 
-function loadFromStorage(key: string): Set<number> {
+/**
+ * Returns the stored collapse preference, or null if the user never collapsed
+ * or expanded a stage for this job.
+ */
+function loadFromStorage(key: string): Set<number> | null {
   try {
     const stored = window.localStorage.getItem(key);
     if (stored) {
@@ -14,15 +18,13 @@ function loadFromStorage(key: string): Set<number> {
       window.localStorage.removeItem(key);
     } catch {}
   }
-  return new Set();
+  return null;
 }
 
 function saveToStorage(key: string, ids: Set<number>) {
   try {
-    if (ids.size === 0) {
-      window.localStorage.removeItem(key);
-      return;
-    }
+    // An empty list is stored as well: it records that the user expanded
+    // everything, which must win over the computed default.
     window.localStorage.setItem(key, JSON.stringify([...ids]));
   } catch {
     // ignore
@@ -134,6 +136,61 @@ export function collectParentStageIds(stages: StageInfo[]): Set<number> {
   return ids;
 }
 
+function findAncestorIds(stages: StageInfo[], targetId: number): number[] {
+  function walk(nodes: StageInfo[]): number[] | null {
+    for (const stage of nodes) {
+      if (stage.id === targetId) return [];
+      const path = walk(stage.children);
+      if (path !== null) {
+        path.push(stage.id);
+        return path;
+      }
+    }
+    return null;
+  }
+  return walk(stages) ?? [];
+}
+
+function isFocusState(state: Result): boolean {
+  return (
+    state === Result.running ||
+    state === Result.paused ||
+    state === Result.failure
+  );
+}
+
+/**
+ * The collapsed stages to use when the user has no stored preference for this
+ * job: while a stage is running, paused or has failed, collapse every group
+ * that does not contain such a stage (or the selected stage). Otherwise,
+ * nothing is collapsed.
+ */
+export function defaultCollapsedStageIds(
+  stages: StageInfo[],
+  selectedStageId?: number,
+): Set<number> {
+  const keepOpen = new Set<number>();
+  let hasFocus = false;
+  function walk(list: StageInfo[], ancestors: number[]) {
+    for (const stage of list) {
+      if (stage.children.length > 0) {
+        walk(stage.children, [...ancestors, stage.id]);
+      } else if (isFocusState(stage.state)) {
+        hasFocus = true;
+        ancestors.forEach((id) => keepOpen.add(id));
+      }
+    }
+  }
+  walk(stages, []);
+  if (!hasFocus) return new Set();
+  if (selectedStageId != null) {
+    findAncestorIds(stages, selectedStageId).forEach((id) => keepOpen.add(id));
+  }
+  return new Set(
+    [...collectParentStageIds(stages)].filter((id) => !keepOpen.has(id)),
+  );
+}
+
 /**
  * Walk the original (uncollapsed) stage tree and return the IDs of any
  * collapsed ancestors of the stage with the given id (plus the target
@@ -176,8 +233,15 @@ export function useCollapsedStages(
   selectedStageId?: number,
 ) {
   const storageKey = `pgv.collapsedStages/${normalizedParentJobPath}`;
-  const [collapsedStageIds, setCollapsedStageIds] = useState<Set<number>>(() =>
+  // null until the user collapses or expands a stage for this job.
+  const [storedStageIds, setStoredStageIds] = useState<Set<number> | null>(() =>
     loadFromStorage(storageKey),
+  );
+  // Without a stored preference, the default is recomputed on every update so
+  // that it follows the running stage. It is never persisted.
+  const collapsedStageIds = useMemo(
+    () => storedStageIds ?? defaultCollapsedStageIds(stages, selectedStageId),
+    [storedStageIds, stages, selectedStageId],
   );
 
   useEffect(() => {
@@ -186,8 +250,9 @@ export function useCollapsedStages(
 
   const toggleCollapseStage = useCallback(
     (stageId: number) => {
-      setCollapsedStageIds((prev) => {
-        const next = new Set(prev);
+      setStoredStageIds((prev) => {
+        // The first toggle turns the current default into a stored preference.
+        const next = new Set(prev ?? collapsedStageIds);
         if (next.has(stageId)) {
           next.delete(stageId);
         } else {
@@ -197,12 +262,12 @@ export function useCollapsedStages(
         return next;
       });
     },
-    [storageKey],
+    [storageKey, collapsedStageIds],
   );
 
   const setCollapsedIds = useCallback(
     (ids: Set<number>) => {
-      setCollapsedStageIds(ids);
+      setStoredStageIds(ids);
       saveToStorage(storageKey, ids);
     },
     [storageKey],
@@ -231,15 +296,17 @@ export function useCollapsedStages(
 
   // Auto-expand collapsed ancestors when a stage is selected (e.g. via
   // the tree sidebar or ?selected-node= URL param).
+  // The computed default already keeps the selected stage visible.
   useEffect(() => {
-    if (selectedStageId == null || collapsedStageIds.size === 0) return;
+    if (selectedStageId == null || !storedStageIds?.size) return;
     const ancestors = findCollapsedAncestors(
       stages,
       selectedStageId,
-      collapsedStageIds,
+      storedStageIds,
     );
     if (ancestors.length === 0) return;
-    setCollapsedStageIds((prev) => {
+    setStoredStageIds((prev) => {
+      if (!prev) return prev;
       const next = new Set(prev);
       for (const id of ancestors) {
         next.delete(id);
